@@ -7,5 +7,10 @@
 *.dSYM
 *~
 *.swp
+*.py
 *.bak
 *.txt
+/test_data/
+/test_field/
+/word_direct/
+.DS_Store
