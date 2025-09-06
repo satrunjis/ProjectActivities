@@ -89,7 +89,7 @@ void print_literals(uint8_t *buffer_start, uint32_t start, uint32_t end, FILE *o
             uint32_t chunk = len < MAX_COPY ? len : MAX_COPY;
             uint8_t axiscyd = (chunk & 0x7F) << 1 | 1;
             fwrite(&axiscyd, 1, 1, output);
-            axiscyd = (chunk >> 7) & 0x7F;
+            axiscyd = (chunk >> 7) & 0xFF;
             fwrite(&axiscyd, 1, 1, output);
             if (log)
                 fprintf(log, "[DEBUG] print_literals: Writing literal: length=%u, pos=%u\n", chunk, start);
@@ -115,11 +115,11 @@ int lz77_compress(FILE *input, FILE *output, FILE *log)
         return -1;
     }
 
-    uint8_t buffer[MAX_BUFFER_SIZE + SEARCH_BUFFER_SIZE] = {0};
+    uint8_t buffer[MAX_BUFFER_SIZE + LOOKAHEAD_BUFFER_SIZE] = {0};
 
     uint32_t pos_in_buf = 0;
     uint16_t cycle_pos = 0;
-    uint32_t buffer_refill_trigger[] = {SEARCH_BUFFER_SIZE, SEARCH_BUFFER_SIZE + HALF_BUFFER_SIZE, MAX_BUFFER_SIZE};
+    uint32_t buffer_refill_trigger[] = {SEARCH_BUFFER_SIZE + 1, SEARCH_BUFFER_SIZE + HALF_BUFFER_SIZE + 1, MAX_BUFFER_SIZE + 1};
     uint32_t hash_table[HASH_TABLE_SIZE][MAX_MATCH_INDICES] = {0};
     uint8_t pos_in_hash_tabel[HASH_TABLE_SIZE] = {0};
     uint32_t last_pos_math = 0;
@@ -143,7 +143,7 @@ int lz77_compress(FILE *input, FILE *output, FILE *log)
         main_loop_count++;
         if (log)
             fprintf(log, "[DEBUG] lz77_compress: Main loop #%u: read=%d bytes, cycle_pos=%u\n", main_loop_count, bytes_read, cycle_pos);
-        if (main_loop_count > 10000)
+        if (0) // main_loop_count > 10000
         {
             if (log)
                 fprintf(log, "[DEBUG] lz77_compress: ERROR: Main loop exceeded 10000 iterations\n");
@@ -152,7 +152,7 @@ int lz77_compress(FILE *input, FILE *output, FILE *log)
         }
 
         if (cycle_pos & 1)
-            memcpy(buffer + MAX_BUFFER_SIZE, buffer, SEARCH_BUFFER_SIZE);
+            memcpy(buffer + MAX_BUFFER_SIZE, buffer, LOOKAHEAD_BUFFER_SIZE);
 
         match_count = 0;
         total_match_len = 0;
@@ -168,7 +168,7 @@ int lz77_compress(FILE *input, FILE *output, FILE *log)
         }
         inner_loop_count = 0;
         for (uint32_t ihash = hash(buffer + pos_in_buf), max_len_match = MIN_MATCH_LENGTH - 1, max_math_index = 0;
-             (pos_in_buf <= border);
+             (pos_in_buf < border);
              ihash = hash(buffer + pos_in_buf), max_len_match = MIN_MATCH_LENGTH - 1, max_math_index = 0)
         {
             inner_loop_count++;
@@ -262,59 +262,174 @@ int lz77_compress(FILE *input, FILE *output, FILE *log)
     return 0;
 }
 
-#define MAX_INPUT_SIZE (1024 * 1024)
+void cpy(uint8_t *output_buffer, int32_t pos, int32_t offset, int32_t len)
+{
+    if (offset <= 0 || offset > MAX_OUTPUT_BUFFER_SIZE || len <= 0 || len > MAX_OUTPUT_BUFFER_SIZE)
+    {
+        fprintf(stderr, "[ERROR] cpy: Invalid offset=%d or len=%d\n", offset, len);
+        return;
+    }
+    int32_t top_pos = (pos - offset) & OUTPUT_BUF_MASK;
+    if (top_pos + len > MAX_OUTPUT_BUFFER_SIZE) {
+        int first_right = MAX_OUTPUT_BUFFER_SIZE - top_pos;
+        memcpy(output_buffer + pos, output_buffer + top_pos, first_right);
+        memcpy(output_buffer+ pos+ first_right, output_buffer, len - first_right);
+    } else {
+        if(len+pos > MAX_OUTPUT_BUFFER_SIZE){
+            int first_right = MAX_OUTPUT_BUFFER_SIZE - pos;
+            memcpy(output_buffer + pos, output_buffer + top_pos, first_right);
+            memcpy(output_buffer, output_buffer + top_pos+first_right, len - first_right);
+        }else
+            memcpy(output_buffer + pos, output_buffer + top_pos, len);
+    }
+
+}
 
 int lz77_decompress(FILE *input, FILE *output, FILE *log)
 {
-    uint8_t input_buffer[MAX_INPUT_SIZE];
-    uint8_t output_buffer[MAX_INPUT_SIZE] = {0};
-    uint32_t input_size = 0;
-    uint32_t input_pos = 0;
+    uint8_t output_buffer[MAX_OUTPUT_BUFFER_SIZE + HALF_OUTPUT_BUFFER_SIZE] = {0};
+    int32_t cycle_pos = 1;
+    int32_t dwdiw[] = {HALF_OUTPUT_BUFFER_SIZE, 0};
+    int32_t pos = 0;
+    int32_t count;
+    int32_t byte;
+    int64_t total_written = 0;
+    int64_t total_written_to_file = 0;
+    int32_t block_number = 0;
 
-    input_size = fread(input_buffer, 1, MAX_INPUT_SIZE, input);
     if (log)
-        fprintf(log, "[DEBUG] lz77_decompress: Read %u bytes from input\n", input_size);
-    if (input_size == 0)
     {
-        if (log)
-            fprintf(log, "[DEBUG] lz77_decompress: ERROR: No data read from input\n");
-        return -1;
+        fprintf(log, "[INFO] Starting decompression\n");
     }
-    uint32_t output_pos = 0;
-    while (input_pos < input_size)
+
+    while ((byte = fgetc(input)) != EOF)
     {
-        uint8_t type = input_buffer[input_pos] & 1;
-        uint32_t count = input_buffer[input_pos++] >> 1;
-        if (type)
-        {
-            count |= (input_buffer[input_pos++] << 7);
-            if (log)
-                fprintf(log, "[DEBUG] lz77_decompress: Reading literal: length=%u, input_pos=%u\n", count, input_pos);
-            for (uint32_t i = 0; i < count && input_pos < input_size; i++)
-                output_buffer[output_pos++] = input_buffer[input_pos++];
-            if (input_pos > input_size && log)
-                fprintf(log, "[DEBUG] lz77_decompress: WARNING: Input buffer overrun, input_pos=%u, input_size=%u\n", input_pos, input_size);
-        }
-        else
-        {
-            count |= (input_buffer[input_pos++] << 7);
-            uint32_t count2 = input_buffer[input_pos++];
-            if (log)
-                fprintf(log, "[DEBUG] lz77_decompress: Reading match: distance=%u, length=%u, input_pos=%u\n", count, count2, input_pos);
-            for (uint32_t i = 0; i < count2 && output_pos >= count; i++)
+        count = byte >> 1;
+        if (byte & 1)
+        { // Литерал
+            int next_byte = fgetc(input);
+            if (next_byte == EOF)
             {
-                output_buffer[output_pos] = output_buffer[output_pos - count];
-                output_pos++;
+                fprintf(stderr, "[ERROR] EOF at literal length\n");
+                return -1;
+            }
+            count |= next_byte << 7;
+            if (count <= 0 || count > MAX_LITERAL_LENGTH)
+            {
+                fprintf(stderr, "[ERROR] Invalid literal length=%d\n", count);
+                return -1;
             }
 
-            if (output_pos < count && log)
-                fprintf(log, "[DEBUG] lz77_decompress: ERROR: Invalid match, output_pos=%u, distance=%u\n", output_pos, count);
-            if (input_pos < input_size)
-                output_buffer[output_pos++] = input_buffer[input_pos++];
+            size_t bytes_to_read = count;
+            while (bytes_to_read > 0)
+            {
+                size_t chunk = bytes_to_read;
+                if (pos + chunk > MAX_OUTPUT_BUFFER_SIZE)
+                {
+                    chunk = MAX_OUTPUT_BUFFER_SIZE - pos;
+                }
+                if (fread(output_buffer + pos, 1, chunk, input) != chunk)
+                {
+                    fprintf(stderr, "[ERROR] Read error at literal\n");
+                    return -1;
+                }
+                total_written += chunk;
+                bytes_to_read -= chunk;
+                pos = (pos + chunk) & OUTPUT_BUF_MASK;
+            }
+        }
+        else
+        { // Совпадения
+            int next_byte = fgetc(input);
+            if (next_byte == EOF)
+            {
+                fprintf(stderr, "[ERROR] EOF at match distance\n");
+                return -1;
+            }
+            count |= (next_byte << 7);
+            if (count <= 0 || count > MAX_OUTPUT_BUFFER_SIZE)
+            {
+                fprintf(stderr, "[ERROR] Invalid match distance=%d\n", count);
+                return -1;
+            }
+
+            int32_t len = fgetc(input);
+            if (len == EOF)
+            {
+                fprintf(stderr, "[ERROR] EOF at match length\n");
+                return -1;
+            }
+            if (len < MIN_MATCH_LENGTH || len > LOOKAHEAD_BUFFER_SIZE)
+            {
+                fprintf(stderr, "[ERROR] Invalid match length=%u\n", len);
+                return -1;
+            }
+
+            cpy(output_buffer, pos, count, len);
+            total_written += len;
+            pos = (len + pos) & OUTPUT_BUF_MASK;
+
+            int next_char = fgetc(input);
+            if (next_char == EOF)
+            {
+                fprintf(stderr, "[ERROR] EOF at next char\n");
+                return -1;
+            }
+            output_buffer[pos] = next_char;
+            total_written++;
+            pos = (1 + pos) & OUTPUT_BUF_MASK;
+        }
+
+        if (((cycle_pos & 1) && pos >= HALF_OUTPUT_BUFFER_SIZE) || (!(cycle_pos & 1) && pos < HALF_OUTPUT_BUFFER_SIZE))
+        {
+            size_t written = fwrite(output_buffer + dwdiw[cycle_pos & 1], 1, HALF_OUTPUT_BUFFER_SIZE, output);
+            if (written != HALF_OUTPUT_BUFFER_SIZE)
+            {
+                fprintf(stderr, "[ERROR] Write error, written=%zu\n", written);
+                return -1;
+            }
+            total_written_to_file += written;
+            if (log)
+            {
+                fprintf(log, "[INFO] Block %d written, size=%zu, total_written_to_file=%lld\n",
+                        block_number, written, total_written_to_file);
+            }
+            block_number++;
+            cycle_pos++;
         }
     }
+
+    int64_t remaining = total_written - total_written_to_file;
+    if (remaining < 0 || remaining > HALF_OUTPUT_BUFFER_SIZE)
+    {
+        fprintf(stderr, "[ERROR] Invalid remaining: %lld\n", remaining);
+        return -1;
+    }
+    if (remaining > 0)
+    {
+        int32_t src_offset = dwdiw[cycle_pos & 1];
+        if (pos < src_offset)
+        {
+            src_offset = (src_offset == HALF_OUTPUT_BUFFER_SIZE) ? 0 : HALF_OUTPUT_BUFFER_SIZE;
+        }
+        size_t written = fwrite(output_buffer + src_offset, 1, remaining, output);
+        if (written != remaining)
+        {
+            fprintf(stderr, "[ERROR] Final write error, written=%zu\n", written);
+            return -1;
+        }
+        total_written_to_file += written;
+        if (log)
+        {
+            fprintf(log, "[INFO] Final block written, size=%zu, total_written_to_file=%lld\n",
+                    written, total_written_to_file);
+        }
+    }
+
     if (log)
-        fprintf(log, "[DEBUG] lz77_decompress: Writing %u bytes to output\n", output_pos);
-    fwrite(output_buffer, 1, output_pos, output);
+    {
+        fprintf(log, "[INFO] Decompression completed, total_written=%lld, total_written_to_file=%lld, blocks=%d\n",
+                total_written, total_written_to_file, block_number);
+    }
     return 0;
 }

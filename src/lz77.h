@@ -17,7 +17,10 @@
 #define SEARCH_BUFFER_SIZE (HASH_TABLE_SIZE)
 #define MAX_BUFFER_SIZE ((SEARCH_BUFFER_SIZE + LOOKAHEAD_BUFFER_SIZE) << 1)
 #define HALF_BUFFER_SIZE (MAX_BUFFER_SIZE >> 1)
-
+#define MAX_OUTPUT_BUFFER_SIZE (HASH_TABLE_SIZE << 2)
+#define HALF_OUTPUT_BUFFER_SIZE (MAX_OUTPUT_BUFFER_SIZE >> 1)
+#define OUTPUT_BUF_MASK (MAX_OUTPUT_BUFFER_SIZE - 1)
+#define MAX_LITERAL_LENGTH MAX_BUFFER_SIZE
 // Структура для хранения статистики блока
 typedef struct {
     uint32_t block_number;    // Номер блока
